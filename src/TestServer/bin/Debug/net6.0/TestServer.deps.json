@@ -1,0 +1,36 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v6.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v6.0": {
+      "TestServer/1.0.0": {
+        "dependencies": {
+          "KbWebSocketServer": "0.2.0"
+        },
+        "runtime": {
+          "TestServer.dll": {}
+        }
+      },
+      "KbWebSocketServer/0.2.0": {
+        "runtime": {
+          "KbWebSocketServer.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "TestServer/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "KbWebSocketServer/0.2.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

@@ -3,7 +3,9 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.1.32407.343
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "KbWebSocketServer", "KbWebSocketServer.csproj", "{C41ED417-E7CF-42E0-A914-1E4B781CB93E}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "KbWebSocketServer", "KbWebSocketServer\KbWebSocketServer.csproj", "{C41ED417-E7CF-42E0-A914-1E4B781CB93E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TestServer", "TestServer\TestServer.csproj", "{B3ED2669-B079-41D6-A36C-155390B8D355}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -15,6 +17,10 @@ Global
 		{C41ED417-E7CF-42E0-A914-1E4B781CB93E}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{C41ED417-E7CF-42E0-A914-1E4B781CB93E}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{C41ED417-E7CF-42E0-A914-1E4B781CB93E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B3ED2669-B079-41D6-A36C-155390B8D355}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B3ED2669-B079-41D6-A36C-155390B8D355}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B3ED2669-B079-41D6-A36C-155390B8D355}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B3ED2669-B079-41D6-A36C-155390B8D355}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
