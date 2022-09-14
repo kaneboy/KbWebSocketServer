@@ -1,4 +1,5 @@
-﻿using System.Collections.Immutable;
+﻿using System.Net;
+using System.Collections.Immutable;
 using System.Net.WebSockets;
 using KbWebSocketServer;
 
@@ -10,15 +11,40 @@ internal class Program
     {
         var wss = new WebSocketServer(8888);
 
-        List<WebSocket> clients = new List<WebSocket>();
+        var clients = ImmutableArray<WebSocket>.Empty;
 
         wss.Start(async ctx =>
         {
             var ws = await ctx.AcceptWebSocketAsync();
-            lock (clients)
-                clients.Add(ws);
-            Echo(clients, ws);
+            ImmutableInterlocked.Update(
+                ref clients,
+                arr => arr.Add(ws));
+            Pub(ws);
         });
+
+        async ValueTask Pub(WebSocket ws)
+        {
+            var textMessages = ws
+                .ReceiveMessagesAsync()
+                .Where(msg => msg.MessageType == WebSocketMessageType.Text);
+            
+            await foreach (var message in textMessages)
+            {
+                if (message.Text.ToString().Equals("PleaseClose", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ws.CloseAsync(
+                        WebSocketCloseStatus.NormalClosure, 
+                        "Closed by server.", 
+                        CancellationToken.None);
+                    break;
+                }
+            }
+
+            if (ws.State != WebSocketState.Open)
+            {
+                Console.WriteLine($"a client is disconnected. state={ws.State}");
+            }
+        }
 
         Console.ReadLine();
     }
