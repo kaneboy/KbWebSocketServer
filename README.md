@@ -53,7 +53,7 @@ wss.Start(async ctx =>
     // set an error status code.
     ctx.ResponseStatusCode = HttpStatusCode.Unauthorized;
     // put some error information in response headers,
-    // to allow client get error details from server response.
+    // to allow client getting error details from server response.
     //
     // it's optional, but useful.
     ctx.ResponseHeaders.Add("x-custom-error", "You shall not pass!");
