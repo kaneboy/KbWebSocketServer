@@ -86,6 +86,9 @@ public sealed class WebSocketServer
     /// </summary>
     public void Start(Func<WebSocketUpgradeContext, ValueTask> clientRequestHandler)
     {
+        if (clientRequestHandler == null)
+            throw new ArgumentNullException(nameof(clientRequestHandler));
+
         // 避免重复启动。
         lock (_startedLocker)
         {
