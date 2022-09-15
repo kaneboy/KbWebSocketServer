@@ -16,8 +16,6 @@ namespace KbWebSocketServer.WebSockets;
 /// </remarks>
 internal sealed class ConnectedWebSocket : WebSocket
 {
-    // 此连接所属的WebSocket服务端。
-    private readonly WebSocketServer _wsServer;
 
     private readonly WebSocket _webSocket;
     private readonly TcpClient _tcpClient;
@@ -27,12 +25,10 @@ internal sealed class ConnectedWebSocket : WebSocket
     /// 使用底层WebSocket对象初始化对象。
     /// </summary>
     internal ConnectedWebSocket(
-        WebSocketServer server,
         TcpClient tcpClient,
         Stream stream,
         WebSocket webSocket)
     {
-        _wsServer = server;
         _tcpClient = tcpClient;
         _stream = stream;
         _webSocket = webSocket;

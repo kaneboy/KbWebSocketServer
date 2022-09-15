@@ -2,6 +2,8 @@
 using System.Collections.Immutable;
 using System.Net.WebSockets;
 using KbWebSocketServer;
+using System.Net.Security;
+using System.IO.Compression;
 
 namespace TestServer;
 
@@ -11,45 +13,21 @@ internal class Program
     {
         var wss = new WebSocketServer(8888);
 
-        var clients = ImmutableArray<WebSocket>.Empty;
+        wss.ClientStreamDecorator = stream =>
+        {
+            return new SslStream(new GZipStream(stream, CompressionMode.Decompress));
+        };
 
         wss.Start(async ctx =>
         {
             var ws = await ctx.AcceptWebSocketAsync();
-            ImmutableInterlocked.Update(
-                ref clients,
-                arr => arr.Add(ws));
-            Pub(ws);
+            Echo(ws);
         });
-
-        async ValueTask Pub(WebSocket ws)
-        {
-            var textMessages = ws
-                .ReceiveMessagesAsync()
-                .Where(msg => msg.MessageType == WebSocketMessageType.Text);
-            
-            await foreach (var message in textMessages)
-            {
-                if (message.Text.ToString().Equals("PleaseClose", StringComparison.OrdinalIgnoreCase))
-                {
-                    await ws.CloseAsync(
-                        WebSocketCloseStatus.NormalClosure, 
-                        "Closed by server.", 
-                        CancellationToken.None);
-                    break;
-                }
-            }
-
-            if (ws.State != WebSocketState.Open)
-            {
-                Console.WriteLine($"a client is disconnected. state={ws.State}");
-            }
-        }
 
         Console.ReadLine();
     }
 
-    static async ValueTask Echo(List<WebSocket> clients, WebSocket ws)
+    static async ValueTask Echo(WebSocket ws)
     {
         await foreach (var message in ws.ReceiveMessagesAsync())
         {
@@ -58,25 +36,10 @@ internal class Program
                 string text = message.Text.ToString();
                 Console.WriteLine(text);
 
-                ImmutableArray<WebSocket> clientArr;
-                lock (clients)
-                {
-                    clientArr = clients.ToImmutableArray();
-                }
-
-                foreach (WebSocket client in clientArr)
-                {
-                    if (client.State == WebSocketState.Open)
-                    {
-                        await client.SendTextAsync(text);
-                    }
-                }
+                await ws.SendTextAsync($"Reply: {message.Text}");
             }
         }
 
         Console.WriteLine("Someone disconnected.");
-
-        lock (clients)
-            clients.Remove(ws);
     }
 }

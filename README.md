@@ -5,7 +5,8 @@
 `KbWebSocketServer` is a lightweight .net websocket server library.
 - Simple Api interface
 - No 3rd-party package dependency required
-- Target framework: net5.0;net6.0;net7.0
+- Fast and GC friendly
+- Target framework: net5.0 (compatible with higher .net version)
 
 # Usage Tutorials
 
@@ -50,13 +51,21 @@ var wss = new WebSocketServer(8000);
 
 wss.Start(async ctx => 
 {
-    // set an error status code.
-    ctx.ResponseStatusCode = HttpStatusCode.Unauthorized;
-    // put some error information in response headers,
-    // to allow client getting error details from server response.
-    //
-    // it's optional, but useful.
-    ctx.ResponseHeaders.Add("x-custom-error", "You shall not pass!");
+    if (ctx.Request.Ip.ToString() == "127.0.0.1")
+    {
+        // put some error information in response headers,
+        // to allow client getting error details from server response.
+        //
+        // it's optional, but useful.
+        ctx.Response.Set("x-custom-error", "You should not connect from local.");
+
+        // reject client request with status code 401.
+        await ctx.RejectWebSocketAsync(HttpStatusCode.Unauthorized);
+    }
+    else
+    {
+        var ws = await ctx.AcceptWebSocketAsync();
+    }
 });
 ```
 
@@ -190,4 +199,22 @@ async ValueTask Echo(WebSocket ws)
         Console.WriteLine($"a client is disconnected. state={ws.State}");
     }
 }
+```
+
+## Decorate client stream
+
+```c#
+var wss = new WebSocketServer(8000);
+
+// specify a custom decorator to decorate client network stream.
+wss.ClientStreamDecorator = stream =>
+{
+    return new SslStream(new GZipStream(stream, CompressionMode.Decompress));
+};
+
+wss.Start(async ctx => 
+{
+    var ws = await ctx.AcceptWebSocketAsync();
+    Echo(ws);
+});
 ```

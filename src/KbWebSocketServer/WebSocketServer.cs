@@ -31,7 +31,7 @@ public sealed class WebSocketServer
 
     //private ImmutableArray<WebSocket> _clients = ImmutableArray<WebSocket>.Empty;
 
-    private Func<WebSocketAcceptContext, ValueTask>? _clientRequestHandler;
+    private Func<WebSocketUpgradeContext, ValueTask>? _clientRequestHandler;
 
     /// <summary>
     /// 在当前所有可用IP地址的指定端口上初始化WebSocket服务器。
@@ -68,6 +68,14 @@ public sealed class WebSocketServer
     /// </summary>
     public bool Active => _tcpListener.Active;
 
+    /// <summary>
+    /// 为客户端Stream指定一个装饰器。
+    /// </summary>
+    /// <remarks>
+    /// 如果希望对客户端Stream进行额外处理（比如使用SslStream或GzipStream封装原始Stream，以提供数据加密和压缩功能），可以通过指定自定义装饰器实现功能。
+    /// </remarks>
+    public Func<Stream, Stream>? ClientStreamDecorator { get; set; } = null;
+
     ///// <summary>
     ///// 当前所有连接到服务器的WebSocket客户端连接。
     ///// </summary>
@@ -76,7 +84,7 @@ public sealed class WebSocketServer
     /// <summary>
     /// 启动服务器，开始响应客户端请求。
     /// </summary>
-    public void Start(Func<WebSocketAcceptContext, ValueTask> clientRequestHandler)
+    public void Start(Func<WebSocketUpgradeContext, ValueTask> clientRequestHandler)
     {
         // 避免重复启动。
         lock (_startedLocker)
@@ -149,11 +157,84 @@ public sealed class WebSocketServer
     /// </summary>
     private async ValueTask Handshake(TcpClient tcpClient)
     {
-        NetworkStream stream = tcpClient.GetStream();
+        NetworkStream networkStream = tcpClient.GetStream();
+        Stream stream = networkStream;
 
+        // 使用自定义客户端Stream装饰器，对Stream进行额外封装。
+        var clientStreamDecorator = ClientStreamDecorator;
+        if (clientStreamDecorator != null)
+        {
+            try
+            {
+                stream = clientStreamDecorator(stream);
+            } 
+            catch
+            {
+                tcpClient.Dispose();
+                return;
+            }
+        }
+
+        // 等待客户端把所有握手请求的文本发送完毕。
+        string? requestText = await WaitUntilHandshakeRequestReceived(tcpClient, networkStream, stream);
+        if (string.IsNullOrWhiteSpace(requestText))
+        {
+            tcpClient.Dispose();
+            return;
+        }
+
+        // 构建处理客户端请求的Context，执行传给Start()函数的客户端请求处理器。
+
+        WebSocketUpgradeRequest req = new WebSocketUpgradeRequest
+        {
+            TcpClient = tcpClient,
+            ClientStream = stream,
+            RawText = requestText,
+            Headers = ParseRequestHeaders(requestText)
+        };
+
+        WebSocketUpgradeResponse res = new WebSocketUpgradeResponse();
+
+        WebSocketUpgradeContext context = new WebSocketUpgradeContext(
+            req,
+            res,
+            static (ctx, _) => {
+                if (ctx.Response.StatusCode != HttpStatusCode.SwitchingProtocols)
+                    throw new InvalidOperationException($"Response.StatusCode should be {HttpStatusCode.SwitchingProtocols}!");
+                SendHandshakeSuccessResponse(ctx.Request.ClientStream, ctx.Request.RawText, ctx.Response.Headers);
+                WebSocket ws = CreateClientWebSocket(ctx.Request.TcpClient, ctx.Request.ClientStream);
+                return ValueTask.FromResult(ws);
+            },
+            null,
+            static (ctx, _) => {
+                if (ctx.Response.StatusCode == HttpStatusCode.SwitchingProtocols)
+                    throw new InvalidOperationException($"Response.StatusCode should NOT be {HttpStatusCode.SwitchingProtocols}!");
+                SendHandshakeRejectResponse(ctx.Request.ClientStream, ctx.Response.StatusCode, ctx.Response.Headers);
+                return ValueTask.CompletedTask;
+            },
+            null);
+
+        try
+        {
+            await _clientRequestHandler!.Invoke(context).ConfigureAwait(false);
+        }
+        catch
+        {
+            tcpClient.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 等待握手信息接收完毕，返回接收到的请求文本。
+    /// </summary>
+    private static async ValueTask<string?> WaitUntilHandshakeRequestReceived(
+        TcpClient tcpClient, 
+        NetworkStream rawNetworkStream,
+        Stream stream)
+    {
         while (true)
         {
-            while (!stream.DataAvailable && tcpClient.Connected)
+            while (!rawNetworkStream.DataAvailable && tcpClient.Connected)
             {
                 await Task.Delay(0).ConfigureAwait(false);
             }
@@ -165,7 +246,7 @@ public sealed class WebSocketServer
 
             if (!tcpClient.Connected)
             {
-                return;
+                return null;
             }
 
             // 解读出文本内容。
@@ -177,42 +258,11 @@ public sealed class WebSocketServer
                 continue;
             }
 
-            // 运行到这里，拿到了所有握手请求数据。
-
-            WebSocketAcceptContext context = new WebSocketAcceptContext(
-                tcpClient,
-                stream,
-                requestText,
-                ParseRequestHeaders(requestText),
-                static (ctx, self) => {
-                    if (ctx.ResponseStatusCode != HttpStatusCode.SwitchingProtocols)
-                        throw new InvalidOperationException($"Value of property {nameof(ctx.ResponseStatusCode)} should be {HttpStatusCode.SwitchingProtocols}!");
-                    SendHandshakeSuccessResponse(ctx.ClientStream, ctx.RequestRawText, ctx.ResponseHeaders);
-                    WebSocket ws = ((WebSocketServer)self!).CreateClientWebSocket(ctx.TcpClient, ctx.ClientStream);
-                    return ValueTask.FromResult(ws);
-                },
-                this);
-
-            try
-            {
-                await _clientRequestHandler!.Invoke(context).ConfigureAwait(false);
-            } 
-            catch (Exception e)
-            {
-                context.ResponseStatusCode = HttpStatusCode.InternalServerError;
-                context.ResponseHeaders["x-server-error"] = e.Message;
-            }
-
-            if (context.ResponseStatusCode != HttpStatusCode.SwitchingProtocols)
-            {
-                SendHandshakeRejectResponse(context.ClientStream, context.ResponseStatusCode, context.ResponseHeaders);
-            }
-
-            return;
+            return requestText;
         }
     }
 
-    private WebSocket CreateClientWebSocket(TcpClient tcpClient, Stream stream)
+    private static WebSocket CreateClientWebSocket(TcpClient tcpClient, Stream stream)
     {
         WebSocket webSocket = WebSocket.CreateFromStream(
             stream, 
@@ -221,7 +271,6 @@ public sealed class WebSocketServer
             WebSocket.DefaultKeepAliveInterval);
 
         ConnectedWebSocket ws = new ConnectedWebSocket(
-            this, 
             tcpClient, 
             stream, 
             webSocket);
@@ -289,7 +338,7 @@ public sealed class WebSocketServer
 
     private static void WriteUtf8TextToStream(StringBuilder builder, Stream stream)
     {
-        foreach (ReadOnlyMemory<Char> chunk in builder.GetChunks())
+        foreach (ReadOnlyMemory<char> chunk in builder.GetChunks())
         {
             WriteUtf8TextToStream(chunk.Span, stream);
         }
@@ -303,9 +352,9 @@ public sealed class WebSocketServer
         ArrayPool<byte>.Shared.Return(buffer);
     }
 
-    private static string ParseRequestText(TcpClient tcpClient, NetworkStream stream)
+    private static string ParseRequestText(TcpClient tcpClient, Stream stream)
     {
-        int bytesLength = tcpClient.Available;
+        int bytesLength = Math.Max(tcpClient.Available, 1024 * 1024);
         byte[] bytes = ArrayPool<byte>.Shared.Rent(bytesLength);
         int readLength = stream.Read(bytes, 0, bytesLength);
         string requestText = Encoding.UTF8.GetString(bytes, 0, readLength);
