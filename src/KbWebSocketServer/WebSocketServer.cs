@@ -357,7 +357,7 @@ public sealed class WebSocketServer
 
     private static string ParseRequestText(TcpClient tcpClient, Stream stream)
     {
-        int bytesLength = Math.Max(tcpClient.Available, 1024 * 1024);
+        int bytesLength = Math.Max(tcpClient.Available, 1024 * 80);
         byte[] bytes = ArrayPool<byte>.Shared.Rent(bytesLength);
         int readLength = stream.Read(bytes, 0, bytesLength);
         string requestText = Encoding.UTF8.GetString(bytes, 0, readLength);
