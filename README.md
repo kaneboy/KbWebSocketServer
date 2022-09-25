@@ -86,11 +86,29 @@ async ValueTask Echo(WebSocket ws)
     // which can be consumed by `await foreach`.
     await foreach (var message in ws.ReceiveMessagesAsync())
     {
-        // message type can be `Text` or `Binary`.
+        // received a text type message.
         if (message.MessageType == WebSocketMessageType.Text)
         {
+            // the backed span can only be used in current stack frame,
+            // it will be recycled after here.
+            //
+            // if you want to pass it to another async function, make a copy.
+            ReadOnlySpan<text> chars = message.Text;
+
             // send back a text message.
-            await ws.SendTextAsync($"Reply: {message.Text}");
+            await ws.SendTextAsync($"Reply: {chars}");
+        }
+        // received a binary type message.
+        else if (message.MessageType == WebSocketMessageType.Binary)
+        {
+            // the backed span can only be used in current stack frame,
+            // it will be recycled after here.
+            //
+            // if you want to pass it to another async function, make a copy.
+            ReadOnlySpan<byte> bytes = message.Binary;
+
+            // send back a binary message.
+            await ws.SendBinaryAsync(bytes);
         }
     }
 }
