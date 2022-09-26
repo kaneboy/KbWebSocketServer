@@ -137,4 +137,30 @@ internal static class WebSocketReceiveMessagesAsyncExtension
 
         return newBuffer;
     }
+
+    /// <summary>
+    /// 按需增大缓冲区，返回增大后的新缓冲区。
+    /// </summary>
+    /// <param name="buffer">旧的缓冲区。</param>
+    /// <param name="usedSize">旧的缓冲区中已经用了多少。</param>
+    /// <param name="allocator">缓冲区分配函数。</param>
+    /// <param name="releaser">缓冲区回收函数。</param>
+    private static byte[] GrowBuffer(byte[] buffer, int usedSize, Func<int, byte[]> allocator, Action<byte[]> releaser)
+    {
+        // 如果buffer够用，无需grow。
+        if (buffer.Length >= usedSize * 2)
+        {
+            return buffer;
+        }
+
+        // 请求一个双倍大小的新buffer，把原buffer的内容复制进来。
+        int newBufferCapacity = usedSize > 0 ? usedSize * 2 : buffer.Length * 2;
+        byte[] newBuffer = allocator(newBufferCapacity);
+        Buffer.BlockCopy(buffer, 0, newBuffer, 0, usedSize);
+
+        // 归还旧buffer。
+        releaser(buffer);
+
+        return newBuffer;
+    }
 }
