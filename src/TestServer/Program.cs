@@ -13,10 +13,10 @@ internal class Program
     {
         var wss = new WebSocketServer(8888);
 
-        wss.ClientStreamDecorator = stream =>
-        {
-            return new SslStream(new GZipStream(stream, CompressionMode.Decompress));
-        };
+        //wss.ClientStreamDecorator = stream =>
+        //{
+        //    return new SslStream(new GZipStream(stream, CompressionMode.Decompress));
+        //};
 
         wss.Start(async ctx =>
         {

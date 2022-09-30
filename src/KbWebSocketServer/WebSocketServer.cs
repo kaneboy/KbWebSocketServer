@@ -151,7 +151,7 @@ public sealed class WebSocketServer
             {
                 continue;
             }
-            _ = Task.Factory.StartNew(state => Handshake((TcpClient)state!), tcpClient, cancelToken);
+            _ = Task.Run(() => Handshake(tcpClient), cancelToken);
         }
     }
 
@@ -164,7 +164,7 @@ public sealed class WebSocketServer
         Stream stream = networkStream;
 
         // 使用自定义客户端Stream装饰器，对Stream进行额外封装。
-        var clientStreamDecorator = ClientStreamDecorator;
+        Func<Stream, Stream>? clientStreamDecorator = ClientStreamDecorator;
         if (clientStreamDecorator != null)
         {
             try
@@ -178,10 +178,13 @@ public sealed class WebSocketServer
             }
         }
 
-        // 等待客户端把所有握手请求的文本发送完毕。
-        string? requestText = await WaitUntilHandshakeRequestReceived(tcpClient, networkStream, stream);
+        // 读取客户端发送的握手请求文本。
+        //string? requestText = await WaitUntilHandshakeRequestReceived(tcpClient, networkStream, stream);
+        string? requestText = await ReadHandshakeRequestText(tcpClient, stream).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(requestText))
         {
+            // 没有收到合法的握手请求文本，向客户端发送一行文本，然后断开连接。
+            WriteUtf8TextToStream("\r\n  ____          _                      _ \r\n / ___|  ___   | |    ___  _ __   __ _| |\r\n \\___ \\ / _ \\  | |   / _ \\| '_ \\ / _` | |\r\n  ___) | (_) | | |__| (_) | | | | (_| |_|\r\n |____/ \\___/  |_____\\___/|_| |_|\\__, (_)\r\n                                 |___/   \r\n", stream);
             tcpClient.Dispose();
             return;
         }
@@ -227,42 +230,82 @@ public sealed class WebSocketServer
         }
     }
 
+    ///// <summary>
+    ///// 等待握手信息接收完毕，返回接收到的请求文本。
+    ///// </summary>
+    //private static async ValueTask<string?> WaitUntilHandshakeRequestReceived(
+    //    TcpClient tcpClient, 
+    //    NetworkStream rawNetworkStream,
+    //    Stream stream)
+    //{
+    //    while (true)
+    //    {
+    //        while (!rawNetworkStream.DataAvailable && tcpClient.Connected)
+    //        {
+    //            await Task.Delay(25).ConfigureAwait(false);
+    //        }
+    //        // 握手消息至少会包含"get"。
+    //        while (tcpClient.Available < 3 && tcpClient.Connected)
+    //        {
+    //            await Task.Delay(25).ConfigureAwait(false);
+    //        }
+
+    //        if (!tcpClient.Connected)
+    //        {
+    //            return null;
+    //        }
+
+    //        // 解读出文本内容。
+    //        string requestText = ParseRequestText(tcpClient, stream);
+
+    //        // 没有包含"get"，不是握手信息。
+    //        if (!Regex.IsMatch(requestText, "^GET", RegexOptions.IgnoreCase))
+    //        {
+    //            continue;
+    //        }
+
+    //        return requestText;
+    //    }
+    //}
+
     /// <summary>
-    /// 等待握手信息接收完毕，返回接收到的请求文本。
+    /// 从网络流读取握手请求文本。
     /// </summary>
-    private static async ValueTask<string?> WaitUntilHandshakeRequestReceived(
-        TcpClient tcpClient, 
-        NetworkStream rawNetworkStream,
+    private static async ValueTask<string?> ReadHandshakeRequestText(
+        TcpClient tcpClient,
         Stream stream)
     {
-        while (true)
+        // 握手请求的数据包应该不会超过80000。
+        int bufferLength = Math.Max(tcpClient.Available, 80000);
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferLength);
+
+        // 等待握手请求超时时间：5s。
+        using var timeoutCts = new CancellationTokenSource();
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+
+        try
         {
-            while (!rawNetworkStream.DataAvailable && tcpClient.Connected)
-            {
-                await Task.Delay(0).ConfigureAwait(false);
-            }
-            // 握手消息至少会包含"get"。
-            while (tcpClient.Available < 3 && tcpClient.Connected)
-            {
-                await Task.Delay(0).ConfigureAwait(false);
-            }
-
-            if (!tcpClient.Connected)
-            {
-                return null;
-            }
-
-            // 解读出文本内容。
-            string requestText = ParseRequestText(tcpClient, stream);
-
-            // 没有包含"get"，不是握手信息。
-            if (!Regex.IsMatch(requestText, "^GET", RegexOptions.IgnoreCase))
-            {
-                continue;
-            }
-
-            return requestText;
+            int readLength = await stream.ReadAsync(buffer.AsMemory(0, bufferLength), timeoutCts.Token).ConfigureAwait(false);
+            string requestText = Encoding.UTF8.GetString(buffer, 0, readLength);
+            return IsHandshakeRequest(requestText) ? requestText : null;
         }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static bool IsHandshakeRequest(string? requestText)
+    {
+        if (string.IsNullOrWhiteSpace(requestText))
+            return false;
+        return requestText.Contains("GET", StringComparison.OrdinalIgnoreCase) &&
+               requestText.Contains("Connection:", StringComparison.OrdinalIgnoreCase) &&
+               requestText.Contains("Upgrade", StringComparison.OrdinalIgnoreCase);
     }
 
     private static WebSocket CreateClientWebSocket(TcpClient tcpClient, Stream stream)
@@ -349,21 +392,22 @@ public sealed class WebSocketServer
 
     private static void WriteUtf8TextToStream(ReadOnlySpan<char> text, Stream stream)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(text.Length * 8);
-        int bytesLength = Encoding.UTF8.GetBytes(text, buffer);
+        int bytesLength = Encoding.UTF8.GetByteCount(text);
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(bytesLength);
+        bytesLength = Encoding.UTF8.GetBytes(text, buffer);
         stream.Write(buffer, 0, bytesLength);
         ArrayPool<byte>.Shared.Return(buffer);
     }
 
-    private static string ParseRequestText(TcpClient tcpClient, Stream stream)
-    {
-        int bytesLength = Math.Max(tcpClient.Available, 1024 * 80);
-        byte[] bytes = ArrayPool<byte>.Shared.Rent(bytesLength);
-        int readLength = stream.Read(bytes, 0, bytesLength);
-        string requestText = Encoding.UTF8.GetString(bytes, 0, readLength);
-        ArrayPool<byte>.Shared.Return(bytes);
-        return requestText;
-    }
+    //private static string ParseRequestText(TcpClient tcpClient, Stream stream)
+    //{
+    //    int bytesLength = Math.Max(tcpClient.Available, 1024 * 80);
+    //    byte[] bytes = ArrayPool<byte>.Shared.Rent(bytesLength);
+    //    int readLength = stream.Read(bytes, 0, bytesLength);
+    //    string requestText = Encoding.UTF8.GetString(bytes, 0, readLength);
+    //    ArrayPool<byte>.Shared.Return(bytes);
+    //    return requestText;
+    //}
 
     /// <summary>
     /// 解析Sec-WebSocket-Key，生成需要返回的Sec-WebSocket-Accept。
