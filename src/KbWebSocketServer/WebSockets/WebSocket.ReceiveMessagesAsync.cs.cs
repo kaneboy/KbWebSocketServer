@@ -1,10 +1,12 @@
-using System.Threading;
-using System;
-using System.Collections.Generic;
-using System.Runtime.CompilerServices;
-using System.Net.WebSockets;
+﻿using System;
 using System.Buffers;
+using System.Collections.Generic;
+using System.Net.WebSockets;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
 
 namespace KbWebSocketServer.WebSockets;
 
@@ -18,21 +20,86 @@ internal static class WebSocketReceiveMessagesAsyncExtension
     /// </remarks>
     public static async IAsyncEnumerable<WebSocketMessage> ReceiveMessagesAsync(
         WebSocket webSocket,
+        MemoryPool<byte>? memoryPool = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // 在此函数生命周期内，一直使用这个缓冲区。函数尾释放它。
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(4096);
+        // 如果未指定缓冲池，使用默认的。
+        memoryPool ??= MemoryPool<byte>.Shared;
+
+        // 收掉一条完整消息之后，立即将消息放在这个Channel。
+        Channel<(IMemoryOwner<byte>, int, WebSocketMessageType)> receivedMessages = Channel.CreateUnbounded<(IMemoryOwner<byte>, int, WebSocketMessageType)>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true,
+        });
+
+        // 异步接收消息，收到消息就扔进Channel。
+        _ = ReceiveBytesAsync(
+            webSocket,
+            memoryPool,
+            (buffer, size, messageType) => receivedMessages.Writer.TryWrite((buffer, size, messageType)),
+            cancellationToken);
+
+        // 从Channel逐个读取消息，将消息封装成文本/二进制消息，返回给调用者。
+        await foreach (var (buffer, size, messageType) in receivedMessages.Reader.ReadAllAsync(cancellationToken))
+        {
+            ReadOnlyMemory<byte> messageFullBytes = buffer.Memory.Slice(0, size);
+
+            if (messageType == WebSocketMessageType.Binary)
+            {
+                yield return new WebSocketMessage(messageFullBytes);
+            }
+
+            if (messageType == WebSocketMessageType.Text)
+            {
+                Encoding utf8 = Encoding.UTF8;
+                int charCount = utf8.GetCharCount(messageFullBytes.Span);
+                char[] charArr = ArrayPool<char>.Shared.Rent(charCount);
+                Memory<char> charBuffer = new Memory<char>(charArr, 0, charCount);
+                utf8.GetChars(messageFullBytes.Span, charBuffer.Span);
+                try
+                {
+                    yield return new WebSocketMessage(charBuffer);
+                }
+                finally
+                {
+                    ArrayPool<char>.Shared.Return(charArr);
+                }
+            }
+
+            // 释放buffer。
+            buffer.Dispose();
+        }
+
+        receivedMessages.Writer.Complete();
+    }
+
+    /// <summary>
+    /// 从WebSocket接收二进制消息。调用者获取到返回的IMemoryOwner后，必须自行释放。
+    /// </summary>
+    private static async ValueTask ReceiveBytesAsync(
+        WebSocket webSocket,
+        MemoryPool<byte> memoryPool,
+        Action<IMemoryOwner<byte>, int, WebSocketMessageType> messageHandler,
+        CancellationToken cancellationToken = default)
+    {
+        int maxMessageSize = 0;
+
+        IMemoryOwner<byte>? buffer = null;
         int receivedByteSize = 0;
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            // 从内存池请求一个buffer。
+            buffer ??= memoryPool.Rent();
+
             // 完成一次数据接收。
             ValueWebSocketReceiveResult receiveResult;
             try
             {
                 receiveResult = await webSocket
                     .ReceiveAsync(
-                        buffer.AsMemory(receivedByteSize, buffer.Length - receivedByteSize), 
+                        buffer.Memory[receivedByteSize..],
                         cancellationToken)
                     .ConfigureAwait(false);
             }
@@ -55,15 +122,12 @@ internal static class WebSocketReceiveMessagesAsyncExtension
                 {
                     await webSocket
                         .CloseAsync(
-                            webSocket.CloseStatus ?? WebSocketCloseStatus.NormalClosure, 
-                            webSocket.CloseStatusDescription, 
+                            webSocket.CloseStatus ?? WebSocketCloseStatus.NormalClosure,
+                            webSocket.CloseStatusDescription,
                             CancellationToken.None)
                         .ConfigureAwait(false);
                 }
-                catch
-                {
-                    //
-                }
+                catch { /**/ }
                 break;
             }
 
@@ -78,89 +142,41 @@ internal static class WebSocketReceiveMessagesAsyncExtension
             // message尚未接收完整，进行下一轮接收。
             if (!endOfMessage)
             {
-                buffer = GrowBuffer(buffer, receivedByteSize);
+                // 如果buffer空闲空间不太够，增大buffer。
+                int freeSize = buffer.Memory.Length - receivedByteSize;
+                if (freeSize < 4096)
+                {
+                    GrowBuffer(ref buffer, memoryPool, receivedByteSize);
+                }
                 continue;
             }
 
-            // 整条消息已接受完整，将完整消息返回给调用者。                
-            if (messageType == WebSocketMessageType.Binary)
-            {
-                // 收到的是二进制消息，可以直接交给调用者。
-                yield return new WebSocketMessage(buffer, receivedByteSize);
-            }
-            else if (messageType == WebSocketMessageType.Text)
-            {
-                // 收到的是文本消息，需要先解析出文本内容，再交给调用者。
-                Encoding utf8 = Encoding.UTF8;
-                int charsBufferSize = utf8.GetCharCount(buffer, 0, receivedByteSize);
-                char[] charsBuffer = ArrayPool<char>.Shared.Rent(charsBufferSize);
-                int charsSize = utf8.GetChars(buffer, 0, receivedByteSize, charsBuffer, 0);
-                try
-                {
-                    yield return new WebSocketMessage(charsBuffer, charsSize);
-                }
-                finally
-                {
-                    ArrayPool<char>.Shared.Return(charsBuffer);
-                }
-            }
-
-            // 处理并返回了一个完整消息，继续下一轮接收。
+            // 整条消息已接受完整，将完整消息返回给调用者。
+            // buffer的所有权将转交给调用者，这里不再引用这个buffer。
+            messageHandler(buffer, receivedByteSize, messageType);
+            buffer = null;
+            maxMessageSize = Math.Max(maxMessageSize, receivedByteSize);
             receivedByteSize = 0;
         }
 
         // 此时连接已断开。
 
-        ArrayPool<byte>.Shared.Return(buffer);
+        buffer?.Dispose();
     }
 
-    /// <summary>
-    /// 按需增大缓冲区，返回增大后的新缓冲区。
-    /// </summary>
-    /// <param name="buffer">旧的缓冲区。</param>
-    /// <param name="usedSize">旧的缓冲区中已经用了多少。</param>
-    private static T[] GrowBuffer<T>(T[] buffer, int usedSize)
+    private static void GrowBuffer(ref IMemoryOwner<byte> buffer, MemoryPool<byte> memoryPool, int usedSize)
     {
-        // 如果buffer够用，无需grow。
-        if (buffer.Length >= usedSize * 2)
-        {
-            return buffer;
-        }
+        // 请求一个空间倍增的新缓冲区。
+        int newSize = Math.Max(buffer.Memory.Length * 2, 4096);
+        IMemoryOwner<byte> newBuffer = memoryPool.Rent(newSize);
 
-        // 请求一个双倍大小的新buffer，把原buffer的内容复制进来。
-        int newBufferCapacity = usedSize > 0 ? usedSize * 2 : buffer.Length * 2;
-        T[] newBuffer = ArrayPool<T>.Shared.Rent(newBufferCapacity);
-        Buffer.BlockCopy(buffer, 0, newBuffer, 0, usedSize);
+        // 将旧缓冲区的数据复制到新缓冲区。
+        buffer.Memory.Slice(0, usedSize).CopyTo(newBuffer.Memory.Slice(0, usedSize));
 
-        // 归还旧buffer。
-        ArrayPool<T>.Shared.Return(buffer);
+        // 释放旧缓冲区。
+        buffer.Dispose();
 
-        return newBuffer;
-    }
-
-    /// <summary>
-    /// 按需增大缓冲区，返回增大后的新缓冲区。
-    /// </summary>
-    /// <param name="buffer">旧的缓冲区。</param>
-    /// <param name="usedSize">旧的缓冲区中已经用了多少。</param>
-    /// <param name="allocator">缓冲区分配函数。</param>
-    /// <param name="releaser">缓冲区回收函数。</param>
-    private static byte[] GrowBuffer(byte[] buffer, int usedSize, Func<int, byte[]> allocator, Action<byte[]> releaser)
-    {
-        // 如果buffer够用，无需grow。
-        if (buffer.Length >= usedSize * 2)
-        {
-            return buffer;
-        }
-
-        // 请求一个双倍大小的新buffer，把原buffer的内容复制进来。
-        int newBufferCapacity = usedSize > 0 ? usedSize * 2 : buffer.Length * 2;
-        byte[] newBuffer = allocator(newBufferCapacity);
-        Buffer.BlockCopy(buffer, 0, newBuffer, 0, usedSize);
-
-        // 归还旧buffer。
-        releaser(buffer);
-
-        return newBuffer;
+        // 修改ref参数，指向新缓冲区。
+        buffer = newBuffer;
     }
 }

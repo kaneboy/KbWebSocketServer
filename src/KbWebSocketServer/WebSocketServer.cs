@@ -21,9 +21,8 @@ public sealed class WebSocketServer
 {
     private static readonly ThreadLocal<StringBuilder> s_stringBuilderCache = new ThreadLocal<StringBuilder>(() => new StringBuilder());
 
-    private readonly IPAddress _hostIp;
-    private readonly int _hostPort;
     private readonly TcpListenerEx _tcpListener;
+    private readonly MemoryPool<byte> _memoryPool;
 
     private readonly object _startedLocker = new object();
 
@@ -36,32 +35,33 @@ public sealed class WebSocketServer
     /// <summary>
     /// 在当前所有可用IP地址的指定端口上初始化WebSocket服务器。
     /// </summary>
-    public WebSocketServer(int port) : this(IPAddress.Any, port) { }
+    public WebSocketServer(int port, MemoryPool<byte>? memoryPool = null) : this(IPAddress.Any, port, memoryPool) { }
 
     /// <summary>
     /// 在指定IP地址和端口上初始化WebSocket服务器。
     /// </summary>
-    public WebSocketServer(string ip, int port) : this(IPAddress.Parse(ip), port) { }
+    public WebSocketServer(string ip, int port, MemoryPool<byte>? memoryPool = null) : this(IPAddress.Parse(ip), port, memoryPool) { }
 
     /// <summary>
     /// 在指定IP地址和端口上初始化WebSocket服务器。
     /// </summary>
-    public WebSocketServer(IPAddress ip, int port)
+    public WebSocketServer(IPAddress ip, int port, MemoryPool<byte>? memoryPool = null)
     {
-        _hostIp = ip;
-        _hostPort = port;
+        HostIP = ip;
+        HostPort = port;
         _tcpListener = new TcpListenerEx(ip, port);
+        _memoryPool = memoryPool ?? MemoryPool<byte>.Shared;
     }
 
     /// <summary>
     /// WebSocket服务器的宿主IP地址。
     /// </summary>
-    public IPAddress HostIP => _hostIp;
+    public IPAddress HostIP { get; }
 
     /// <summary>
     /// WebSocket服务器的宿主网络端口。
     /// </summary>
-    public int HostPort => _hostPort;
+    public int HostPort { get; }
 
     /// <summary>
     /// 是否已启动。
@@ -180,7 +180,7 @@ public sealed class WebSocketServer
 
         // 读取客户端发送的握手请求文本。
         //string? requestText = await WaitUntilHandshakeRequestReceived(tcpClient, networkStream, stream);
-        string? requestText = await ReadHandshakeRequestText(tcpClient, stream).ConfigureAwait(false);
+        string? requestText = await ReadHandshakeRequestText(tcpClient, stream, _memoryPool).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(requestText))
         {
             // 没有收到合法的握手请求文本，向客户端发送一行文本，然后断开连接。
@@ -273,11 +273,12 @@ public sealed class WebSocketServer
     /// </summary>
     private static async ValueTask<string?> ReadHandshakeRequestText(
         TcpClient tcpClient,
-        Stream stream)
+        Stream stream,
+        MemoryPool<byte> memoryPool)
     {
         // 握手请求的数据包应该不会超过80000。
         int bufferLength = Math.Max(tcpClient.Available, 80000);
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferLength);
+        using IMemoryOwner<byte> buffer = memoryPool.Rent(bufferLength);
 
         // 等待握手请求超时时间：5s。
         using var timeoutCts = new CancellationTokenSource();
@@ -285,17 +286,13 @@ public sealed class WebSocketServer
 
         try
         {
-            int readLength = await stream.ReadAsync(buffer.AsMemory(0, bufferLength), timeoutCts.Token).ConfigureAwait(false);
-            string requestText = Encoding.UTF8.GetString(buffer, 0, readLength);
+            int readLength = await stream.ReadAsync(buffer.Memory, timeoutCts.Token).ConfigureAwait(false);
+            string requestText = Encoding.UTF8.GetString(buffer.Memory.Slice(0, readLength).Span);
             return IsHandshakeRequest(requestText) ? requestText : null;
         }
         catch
         {
             return null;
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
