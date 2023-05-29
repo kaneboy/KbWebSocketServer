@@ -13,6 +13,19 @@ namespace KbWebSocketServer.WebSockets;
 internal static class WebSocketReceiveMessagesAsyncExtension
 {
     /// <summary>
+    /// 一个完整的WebSocket消息包。
+    /// </summary>
+    internal readonly struct WholeMessage
+    {
+        public IMemoryOwner<byte> Buffer { get; init; }
+        public int Size { get; init; }
+        public WebSocketMessageType MessageType { get; init; }
+
+        public ReadOnlyMemory<byte> MessageBytes => Buffer.Memory[..Size];
+        public void FreeBuffer() => Buffer.Dispose();
+    }
+
+    /// <summary>
     /// 接收消息。使用 await foreach 处理返回的异步集合。
     /// </summary>
     /// <remarks>
@@ -27,63 +40,64 @@ internal static class WebSocketReceiveMessagesAsyncExtension
         memoryPool ??= MemoryPool<byte>.Shared;
 
         // 收掉一条完整消息之后，立即将消息放在这个Channel。
-        Channel<(IMemoryOwner<byte>, int, WebSocketMessageType)> receivedMessages = Channel.CreateUnbounded<(IMemoryOwner<byte>, int, WebSocketMessageType)>(new UnboundedChannelOptions
+        Channel<WholeMessage> receivedMessages = Channel.CreateUnbounded<WholeMessage>(new UnboundedChannelOptions
         {
             SingleReader = true,
             SingleWriter = true,
         });
 
         // 异步接收消息，收到消息就扔进Channel。
-        _ = ReceiveBytesAsync(
+        _ = ReceiveWhileMessageBytesAsync(
             webSocket,
             memoryPool,
-            (buffer, size, messageType) => receivedMessages.Writer.TryWrite((buffer, size, messageType)),
+            msg => receivedMessages.Writer.TryWrite(msg),
             cancellationToken);
 
         // 从Channel逐个读取消息，将消息封装成文本/二进制消息，返回给调用者。
-        await foreach (var (buffer, size, messageType) in receivedMessages.Reader.ReadAllAsync(cancellationToken))
+        await foreach (var message in receivedMessages.Reader.ReadAllAsync(cancellationToken))
         {
-            ReadOnlyMemory<byte> messageFullBytes = buffer.Memory.Slice(0, size);
-
-            if (messageType == WebSocketMessageType.Binary)
+            try
             {
-                yield return new WebSocketMessage(messageFullBytes);
+                if (message.MessageType == WebSocketMessageType.Binary)
+                {
+                    yield return new WebSocketMessage(message.MessageBytes);
+                }
+                else if (message.MessageType == WebSocketMessageType.Text)
+                {
+                    Encoding utf8 = Encoding.UTF8;
+                    int charCount = utf8.GetCharCount(message.MessageBytes.Span);
+                    char[] charArr = ArrayPool<char>.Shared.Rent(charCount);
+                    Memory<char> charBuffer = new Memory<char>(charArr, 0, charCount);
+                    utf8.GetChars(message.MessageBytes.Span, charBuffer.Span);
+                    try
+                    {
+                        yield return new WebSocketMessage(charBuffer);
+                    }
+                    finally
+                    {
+                        ArrayPool<char>.Shared.Return(charArr);
+                    }
+                }
             }
-
-            if (messageType == WebSocketMessageType.Text)
+            finally
             {
-                Encoding utf8 = Encoding.UTF8;
-                int charCount = utf8.GetCharCount(messageFullBytes.Span);
-                char[] charArr = ArrayPool<char>.Shared.Rent(charCount);
-                Memory<char> charBuffer = new Memory<char>(charArr, 0, charCount);
-                utf8.GetChars(messageFullBytes.Span, charBuffer.Span);
-                try
-                {
-                    yield return new WebSocketMessage(charBuffer);
-                }
-                finally
-                {
-                    ArrayPool<char>.Shared.Return(charArr);
-                }
+                message.FreeBuffer();
             }
-
-            // 释放buffer。
-            buffer.Dispose();
         }
 
         receivedMessages.Writer.Complete();
     }
 
     /// <summary>
-    /// 从WebSocket接收二进制消息。调用者获取到返回的IMemoryOwner后，必须自行释放。
+    /// 从WebSocket接收完整的消息包。
     /// </summary>
-    private static async ValueTask ReceiveBytesAsync(
+    private static async ValueTask ReceiveWhileMessageBytesAsync(
         WebSocket webSocket,
         MemoryPool<byte> memoryPool,
-        Action<IMemoryOwner<byte>, int, WebSocketMessageType> messageHandler,
+        Action<WholeMessage> messageHandler,
         CancellationToken cancellationToken = default)
     {
-        int maxMessageSize = 0;
+        int maxMessageByteSize = 0;
 
         IMemoryOwner<byte>? buffer = null;
         int receivedByteSize = 0;
@@ -91,7 +105,7 @@ internal static class WebSocketReceiveMessagesAsyncExtension
         while (!cancellationToken.IsCancellationRequested)
         {
             // 从内存池请求一个buffer。
-            buffer ??= memoryPool.Rent();
+            buffer ??= memoryPool.Rent(maxMessageByteSize);
 
             // 完成一次数据接收。
             ValueWebSocketReceiveResult receiveResult;
@@ -153,9 +167,9 @@ internal static class WebSocketReceiveMessagesAsyncExtension
 
             // 整条消息已接受完整，将完整消息返回给调用者。
             // buffer的所有权将转交给调用者，这里不再引用这个buffer。
-            messageHandler(buffer, receivedByteSize, messageType);
+            messageHandler(new WholeMessage { MessageType = messageType, Buffer = buffer, Size = receivedByteSize });
             buffer = null;
-            maxMessageSize = Math.Max(maxMessageSize, receivedByteSize);
+            maxMessageByteSize = Math.Max(maxMessageByteSize, receivedByteSize);
             receivedByteSize = 0;
         }
 
