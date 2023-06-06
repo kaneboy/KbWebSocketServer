@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO.Pipelines;
 using System.Net.WebSockets;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -13,109 +15,101 @@ namespace KbWebSocketServer.WebSockets;
 internal static class WebSocketReceiveMessagesAsyncExtension
 {
     /// <summary>
-    /// 一个完整的WebSocket消息包。
-    /// </summary>
-    internal readonly struct WholeMessage
-    {
-        public IMemoryOwner<byte> Buffer { get; init; }
-        public int Size { get; init; }
-        public WebSocketMessageType MessageType { get; init; }
-
-        public ReadOnlyMemory<byte> MessageBytes => Buffer.Memory[..Size];
-        public void FreeBuffer() => Buffer.Dispose();
-    }
-
-    /// <summary>
-    /// 接收消息。使用 await foreach 处理返回的异步集合。
+    /// 从 <paramref name="webSocket"/> 接收消息。使用 await foreach 处理返回的异步集合。
     /// </summary>
     /// <remarks>
-    /// 如果连接意外中断，异步集合将正常结束而不会抛出异常。
+    /// 如果 <paramref name="webSocket"/> 连接中断，异步集合将正常结束而不会抛出异常。如果 <paramref name="cancellationToken"/> 触发取消，抛出操作取消异常。
     /// </remarks>
     public static async IAsyncEnumerable<WebSocketMessage> ReceiveMessagesAsync(
         WebSocket webSocket,
         MemoryPool<byte>? memoryPool = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // 如果未指定缓冲池，使用默认的。
-        memoryPool ??= MemoryPool<byte>.Shared;
+        // 创建一个 pipe，用于暂存从 websocket 收到的完整消息包的二进制数据。
+        Pipe pipe = new Pipe(new PipeOptions(pool: memoryPool ?? MemoryPool<byte>.Shared));
 
-        // 收掉一条完整消息之后，立即将消息放在这个Channel。
-        Channel<WholeMessage> receivedMessages = Channel.CreateUnbounded<WholeMessage>(new UnboundedChannelOptions
+        // 使用这个 channel 当异步队列使用，每收到一个完整消息包，就会往这里塞入一个数据。
+        // 消息包的真正二进制内容位于 pipe 里面，这里只记录消息包的类型和长度。
+        Channel<(WebSocketMessageType, int)> messageEvents = Channel.CreateUnbounded<(WebSocketMessageType, int)>(new UnboundedChannelOptions
         {
             SingleReader = true,
             SingleWriter = true,
         });
 
-        // 异步接收消息，收到消息就扔进Channel。
-        _ = ReceiveWhileMessageBytesAsync(
+        // 异步从 websocket 读取完整消息包，将消息包放进事件队列。
+        _ = ReadMessageAndWriteToBufferWriterAsync(
             webSocket,
-            memoryPool,
-            msg => receivedMessages.Writer.TryWrite(msg),
+            pipe.Writer,
+            onMessage: static (msgQueue, msgType, msgSize) => msgQueue.Writer.TryWrite((msgType, msgSize)),
+            onCompleted: static msgQueue => msgQueue.Writer.TryComplete(),
+            messageEvents,
             cancellationToken);
 
-        // 从Channel逐个读取消息，将消息封装成文本/二进制消息，返回给调用者。
-        await foreach (var message in receivedMessages.Reader.ReadAllAsync(cancellationToken))
+        // 逐个接收消息包到达的事件。
+        await foreach (var (msgType, msgSize) in messageEvents.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
         {
-            try
+            // 从 pipe 读完整消息包。
+            var readResult = await ReadAtLeastAsync(pipe.Reader, msgSize, cancellationToken).ConfigureAwait(false);
+
+            if (readResult.Buffer.Length != 0)
             {
-                if (message.MessageType == WebSocketMessageType.Binary)
+                switch (msgType)
                 {
-                    yield return new WebSocketMessage(message.MessageBytes);
-                }
-                else if (message.MessageType == WebSocketMessageType.Text)
-                {
-                    Encoding utf8 = Encoding.UTF8;
-                    int charCount = utf8.GetCharCount(message.MessageBytes.Span);
-                    char[] charArr = ArrayPool<char>.Shared.Rent(charCount);
-                    Memory<char> charBuffer = new Memory<char>(charArr, 0, charCount);
-                    utf8.GetChars(message.MessageBytes.Span, charBuffer.Span);
-                    try
+                    case WebSocketMessageType.Binary:
+                        yield return new WebSocketMessage(readResult.Buffer.Slice(0, msgSize));
+                        break;
+                    case WebSocketMessageType.Text:
                     {
-                        yield return new WebSocketMessage(charBuffer);
-                    }
-                    finally
-                    {
-                        ArrayPool<char>.Shared.Return(charArr);
+                        Encoding utf8 = Encoding.UTF8;
+                        char[] charArr = ArrayPool<char>.Shared.Rent(utf8.GetMaxCharCount(msgSize));
+                        int charCount = utf8.GetChars(readResult.Buffer.Slice(0, msgSize), charArr.AsSpan());
+                        try
+                        {
+                            yield return new WebSocketMessage(charArr.AsMemory(0, charCount));
+                        }
+                        finally
+                        {
+                            ArrayPool<char>.Shared.Return(charArr);
+                        }
+                        break;
                     }
                 }
             }
-            finally
-            {
-                message.FreeBuffer();
-            }
+
+            if (readResult.IsCanceled || readResult.IsCompleted)
+                break;
+
+            pipe.Reader.AdvanceTo(readResult.Buffer.GetPosition(msgSize), readResult.Buffer.End);
         }
 
-        receivedMessages.Writer.Complete();
+        // 此 websocket 所有消息接收完成。
+        Debug.WriteLine("WebSocket断开连接。");
     }
 
     /// <summary>
-    /// 从WebSocket接收完整的消息包。
+    /// 从 <paramref name="webSocket"/> 接收完整的消息包，写入到 <paramref name="pipeWriter"/>。每次收到一个完整消息包，调用 <paramref name="onMessage"/>，传入消息类型和消息包大小。
     /// </summary>
-    private static async ValueTask ReceiveWhileMessageBytesAsync(
+    private static async ValueTask ReadMessageAndWriteToBufferWriterAsync<TArg>(
         WebSocket webSocket,
-        MemoryPool<byte> memoryPool,
-        Action<WholeMessage> messageHandler,
+        PipeWriter pipeWriter,
+        Action<TArg, WebSocketMessageType, int> onMessage,
+        Action<TArg> onCompleted,
+        TArg arg,
         CancellationToken cancellationToken = default)
     {
-        int maxMessageByteSize = 0;
-
-        IMemoryOwner<byte>? buffer = null;
-        int receivedByteSize = 0;
+        // 一个完整消息包的大小。
+        int messageSize = 0;
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            // 从内存池请求一个buffer。
-            buffer ??= memoryPool.Rent(maxMessageByteSize);
+            // 请求一个buffer。
+            var buffer = pipeWriter.GetMemory();
 
             // 完成一次数据接收。
             ValueWebSocketReceiveResult receiveResult;
             try
             {
-                receiveResult = await webSocket
-                    .ReceiveAsync(
-                        buffer.Memory[receivedByteSize..],
-                        cancellationToken)
-                    .ConfigureAwait(false);
+                receiveResult = await webSocket.ReceiveAsync(buffer, cancellationToken).ConfigureAwait(false);
             }
             catch
             {
@@ -125,7 +119,7 @@ internal static class WebSocketReceiveMessagesAsyncExtension
             }
 
             WebSocketMessageType messageType = receiveResult.MessageType;
-            int messageLength = receiveResult.Count;
+            int receivedSize = receiveResult.Count;
             bool endOfMessage = receiveResult.EndOfMessage;
 
             // 收到对方的close请求，这时State是CloseReceived。
@@ -151,46 +145,38 @@ internal static class WebSocketReceiveMessagesAsyncExtension
                 break;
             }
 
-            receivedByteSize += messageLength;
+            // 将数据写入到bufferWriter。
+            pipeWriter.Advance(receivedSize);
+            await pipeWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-            // message尚未接收完整，进行下一轮接收。
-            if (!endOfMessage)
+            messageSize += receivedSize;
+
+            // 已经收到一个完整的消息包，告诉调用者完整消息包的类型和大小。
+            if (endOfMessage)
             {
-                // 如果buffer空闲空间不太够，增大buffer。
-                int freeSize = buffer.Memory.Length - receivedByteSize;
-                if (freeSize < 4096)
-                {
-                    GrowBuffer(ref buffer, memoryPool, receivedByteSize);
-                }
-                continue;
+                onMessage(arg, messageType, messageSize);
+                messageSize = 0;
             }
-
-            // 整条消息已接受完整，将完整消息返回给调用者。
-            // buffer的所有权将转交给调用者，这里不再引用这个buffer。
-            messageHandler(new WholeMessage { MessageType = messageType, Buffer = buffer, Size = receivedByteSize });
-            buffer = null;
-            maxMessageByteSize = Math.Max(maxMessageByteSize, receivedByteSize);
-            receivedByteSize = 0;
         }
 
         // 此时连接已断开。
-
-        buffer?.Dispose();
+        onCompleted(arg);
     }
 
-    private static void GrowBuffer(ref IMemoryOwner<byte> buffer, MemoryPool<byte> memoryPool, int usedSize)
+    private static async ValueTask<ReadResult> ReadAtLeastAsync(PipeReader reader, int minimumSize, CancellationToken cancellationToken)
     {
-        // 请求一个空间倍增的新缓冲区。
-        int newSize = Math.Max(buffer.Memory.Length * 2, 4096);
-        IMemoryOwner<byte> newBuffer = memoryPool.Rent(newSize);
+        while (true)
+        {
+            var result = await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            var buffer = result.Buffer;
 
-        // 将旧缓冲区的数据复制到新缓冲区。
-        buffer.Memory.Slice(0, usedSize).CopyTo(newBuffer.Memory.Slice(0, usedSize));
+            if (buffer.Length >= minimumSize || result.IsCompleted || result.IsCanceled)
+            {
+                return result;
+            }
 
-        // 释放旧缓冲区。
-        buffer.Dispose();
-
-        // 修改ref参数，指向新缓冲区。
-        buffer = newBuffer;
+            // Keep buffering until we get more data
+            reader.AdvanceTo(buffer.Start, buffer.End);
+        }
     }
 }

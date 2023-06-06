@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.Net.WebSockets;
 
 namespace KbWebSocketServer;
@@ -11,7 +12,7 @@ public readonly struct WebSocketMessage
     /// <summary>
     /// 构造一个二进制类型消息。
     /// </summary>
-    internal WebSocketMessage(ReadOnlyMemory<byte> bytes)
+    internal WebSocketMessage(ReadOnlySequence<byte> bytes)
     {
         MessageType = WebSocketMessageType.Binary;
         Binary = bytes;
@@ -24,7 +25,7 @@ public readonly struct WebSocketMessage
     internal WebSocketMessage(ReadOnlyMemory<char> chars)
     {
         MessageType = WebSocketMessageType.Text;
-        Binary = ReadOnlyMemory<byte>.Empty;
+        Binary = ReadOnlySequence<byte>.Empty;
         Text = chars;
     }
 
@@ -40,7 +41,7 @@ public readonly struct WebSocketMessage
     /// 支持此属性值的内存缓冲区将被自动回收重用，请勿将此属性的使用范围扩展到其他函数栈帧。
     /// 如果确实需要，将此属性值复制一份使用。
     /// </remarks>
-    public ReadOnlyMemory<byte> Binary { get; }
+    public ReadOnlySequence<byte> Binary { get; }
 
     /// <summary>
     /// 消息包含的文本内容（如果消息类型是文本）。
