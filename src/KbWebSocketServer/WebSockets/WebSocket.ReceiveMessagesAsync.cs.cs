@@ -163,6 +163,7 @@ internal static class WebSocketReceiveMessagesAsyncExtension
         onCompleted(arg);
     }
 
+    // .net 5 没有内置 PipeReader.ReadAtLeastAsync()。
     private static async ValueTask<ReadResult> ReadAtLeastAsync(PipeReader reader, int minimumSize, CancellationToken cancellationToken)
     {
         while (true)
